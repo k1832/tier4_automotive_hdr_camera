@@ -133,76 +133,6 @@ gmsl_dser_fragments = [
 ]
 
 
-class I2cMuxInfra:
-    """Holds references to the I2C mux sub-channel nodes so that camera nodes
-    can be added after the camera list is built.  This avoids creating separate
-    FragmentNode instances that use target-path to reference nodes created by
-    the mux fragment — the kernel resolves ALL target-path values before
-    applying any overlay fragments, so self-referencing paths fail."""
-
-    def __init__(self, gmsl_dsers: Sequence[DeviceTreeNode]) -> None:
-        self.i2c_channels = [
-            DeviceTreeNode(f'i2c@{i}')
-                .properties([
-                    'status = "okay"',
-                    f'reg = <{i}>',
-                    'i2c-mux,deselect-on-exit',
-                    '#address-cells = <1>',
-                    '#size-cells = <0>',
-                ])
-                .nodes([gmsl_dsers[i]])
-            for i in range(4)
-        ]
-
-        self.fragments: List[FragmentNode] = [
-            FragmentNode(target_path='/bus@0/i2c@31e0000')
-                .overlay_nodes([
-                    DeviceTreeNode('tca9544@72')
-                        .properties([
-                            'status = "okay"',
-                            'compatible = "nxp,pca9544"',
-                            'reg = <0x72>',
-                            '#address-cells = <1>',
-                            '#size-cells = <0>',
-                            'vcc-supply = <&vdd_1v8_sys>',
-                            'vcc_lp = "vcc"',
-                            'skip_mux_detect = "yes"',
-                            'force_bus_start = <40>',
-                        ])
-                        .nodes(self.i2c_channels)
-                ]),
-            FragmentNode(target_path='/bus@0/i2c@3180000')
-                .overlay_properties([
-                    'status = "okay"',
-                    '#address-cells = <1>',
-                    '#size-cells = <0>',
-                ])
-                .overlay_nodes([
-                    DeviceTreeNode('tca9539@74', label='tca9539_74')
-                        .properties([
-                            'compatible = "ti,tca9539"',
-                            'gpio-controller',
-                            '#gpio-cells = <2>',
-                            'ngpios = <16>',
-                            'reg = <0x74>',
-                            'status = "okay"',
-                        ])
-                        .nodes([
-                            DeviceTreeNode('tca9539_74_outlow')
-                                .properties([
-                                    'status = "okay"',
-                                    'gpio-hog',
-                                    'output-low',
-                                ]),
-                            DeviceTreeNode('ca9539_74_outhigh')
-                                .properties(['status = "disabled"']),
-                            DeviceTreeNode('tca9539_74_input')
-                                .properties(['status = "disabled"']),
-                        ])
-                ])
-        ]
-
-
 def generate_jetson_camera_overlay(opts: GeneratorOptions) -> DeviceTreeNode:
     num_channels = opts.number_of_cameras
 
@@ -240,34 +170,17 @@ def generate_jetson_camera_overlay(opts: GeneratorOptions) -> DeviceTreeNode:
     i2c_mux_path = '/i2c@31e0000/tca9544@72'
     gmsl_dsers: Sequence[DeviceTreeNode] = gmsl_dser_fragments
 
-    i2c_mux_infra: Optional[I2cMuxInfra] = None
-
     if opts.l4t_version.major >= 36:
         i2c_mux_path = '/bus@0' + i2c_mux_path
         gmsl_dsers = gmsl_dsers_nodes
-        i2c_mux_infra = I2cMuxInfra(gmsl_dsers)
-        # NOTE: the base camera DTSI (tegra-camera-base-r36.dtsi) is applied
-        # as a *separate* overlay by camera-hotplug.sh when the live tree
-        # lacks camera pipeline nodes.  It must NOT be embedded here because
-        # the kernel rejects overlay blobs where multiple fragments set the
-        # same property (e.g. status on VI ports set "disabled" by the base
-        # DTSI and "okay" by the camera fragments).
-        root.nodes(i2c_mux_infra.fragments)
+        with open(TEGRA_CAMERA_BASE_OVERLAY_R36, 'r', encoding='utf-8') as tegra_cam_dtsi:
+            (root
+                .header('\n' + tegra_cam_dtsi.read())
+                .nodes(i2c_mux_and_gmsl_dsers(gmsl_dsers)))
     else:
         root.nodes(gmsl_dsers)
 
     cameras = build_cameras(opts.camera_list, gmsl_dsers)
-
-    # For L4T >= 36, embed camera nodes directly in the I2C sub-channel
-    # DeviceTreeNode objects.  This avoids creating separate FragmentNode
-    # instances that use target-path to reference nodes created by the
-    # mux fragment — such self-referencing fails because the kernel resolves
-    # ALL target-path values before applying any overlay fragments.
-    if i2c_mux_infra is not None:
-        i2c_mux_infra.i2c_channels[3].nodes(sum(map(lambda cam: cam.to_list(), cameras[0:2]), []))
-        i2c_mux_infra.i2c_channels[2].nodes(sum(map(lambda cam: cam.to_list(), cameras[2:4]), []))
-        i2c_mux_infra.i2c_channels[1].nodes(sum(map(lambda cam: cam.to_list(), cameras[4:6]), []))
-        i2c_mux_infra.i2c_channels[0].nodes(sum(map(lambda cam: cam.to_list(), cameras[6:8]), []))
 
     graph = MediaGraph(vi_ports, nvcsi_channels, cameras)
     graph.connect_all_endpoints()
@@ -296,9 +209,144 @@ def generate_jetson_camera_overlay(opts: GeneratorOptions) -> DeviceTreeNode:
                     # string list of all the connected cameras
                     'tier4,cameras = %s' % devicetree.string_list([cam.name for cam in opts.camera_list]),
                 ]),
+
+            FragmentNode(target_path=i2c_mux_path)
+                .overlay_properties([
+                    'status = "okay"',
+                    'compatible = "nxp,pca9544"',
+                    'reg = <0x72>',
+                    '#address-cells = <1>',
+                    '#size-cells = <0>',
+                    'vcc-supply = <&vdd_1v8_sys>',
+                    'skip_mux_detect',
+                    f'force_bus_start = <{i2c_bus_number}>',
+                ]),
+            FragmentNode(target_path=f'{i2c_mux_path}/i2c@3')
+                .overlay_properties([
+                    'status = "okay"',
+                    'reg = <3>',
+                    'i2c-mux,deselect-on-exit',
+                ])
+                .overlay_nodes(sum(map(lambda cam: cam.to_list(), cameras[0:2]), [])),
+            FragmentNode(target_path=f'{i2c_mux_path}/i2c@2')
+                .overlay_properties([
+                    'status = "okay"',
+                    'reg = <2>',
+                    'i2c-mux,deselect-on-exit',
+                ])
+                .overlay_nodes(sum(map(lambda cam: cam.to_list(), cameras[2:4]), [])),
+            FragmentNode(target_path=f'{i2c_mux_path}/i2c@1')
+                .overlay_properties([
+                    'status = "okay"',
+                    'reg = <1>',
+                    'i2c-mux,deselect-on-exit',
+                ])
+                .overlay_nodes(sum(map(lambda cam: cam.to_list(), cameras[4:6]), [])),
+            FragmentNode(target_path=f'{i2c_mux_path}/i2c@0')
+                .overlay_properties([
+                    'status = "okay"',
+                    'reg = <0>',
+                    'i2c-mux,deselect-on-exit',
+                ])
+                .overlay_nodes(sum(map(lambda cam: cam.to_list(), cameras[6:8]), []))
         ]))
 
     return root
+
+
+def i2c_mux_and_gmsl_dsers(gmsl_dsers: Sequence[DeviceTreeNode]) -> List[FragmentNode]:
+    return ([
+        FragmentNode(target_path='/bus@0/i2c@31e0000')
+            .overlay_nodes([
+                DeviceTreeNode('tca9544@72')
+                    .properties([
+                        'status = "okay"',
+                        'compatible = "nxp,pca9544"',
+                        'reg = <0x72>',
+                        '#address-cells = <1>',
+                        '#size-cells = <0>',
+                        'vcc-supply = <&vdd_1v8_sys>',
+                        'vcc_lp = "vcc"',
+                        'skip_mux_detect = "yes"',
+                        'force_bus_start = <40>',
+                    ])
+                    .nodes([
+                        DeviceTreeNode('i2c@0')
+                            .properties([
+                                'status = "okay"',
+                                'reg = <0>',
+                                'i2c-mux,deselect-on-exit',
+                                '#address-cells = <1>',
+                                '#size-cells = <0>',
+                            ])
+                            .nodes([
+                                gmsl_dsers[0]
+                            ]),
+                        DeviceTreeNode('i2c@1')
+                            .properties([
+                                'status = "okay"',
+                                'reg = <1>',
+                                'i2c-mux,deselect-on-exit',
+                                '#address-cells = <1>',
+                                '#size-cells = <0>',
+                            ])
+                            .nodes([
+                                gmsl_dsers[1]
+                            ]),
+                        DeviceTreeNode('i2c@2')
+                            .properties([
+                                'status = "okay"',
+                                'reg = <2>',
+                                'i2c-mux,deselect-on-exit',
+                                '#address-cells = <1>',
+                                '#size-cells = <0>',
+                            ])
+                            .nodes([
+                                gmsl_dsers[2]
+                            ]),
+                        DeviceTreeNode('i2c@3')
+                            .properties([
+                                'status = "okay"',
+                                'reg = <3>',
+                                'i2c-mux,deselect-on-exit',
+                                '#address-cells = <1>',
+                                '#size-cells = <0>',
+                            ])
+                            .nodes([
+                                gmsl_dsers[3]
+                            ]),
+                    ])
+            ]),
+            FragmentNode(target_path='/bus@0/i2c@3180000')
+                .overlay_properties([
+                    'status = "okay"',
+                    '#address-cells = <1>',
+                    '#size-cells = <0>',
+                ])
+                .overlay_nodes([
+                    DeviceTreeNode('tca9539@74', label='tca9539_74')
+                        .properties([
+                            'compatible = "ti,tca9539"',
+                            'gpio-controller',
+                            '#gpio-cells = <2>',
+                            'ngpios = <16>',
+                            'reg = <0x74>',
+                            'status = "okay"',
+                        ])
+                        .nodes([
+                            DeviceTreeNode('tca9539_74_outlow')
+                                .properties([
+                                    'status = "okay"',
+                                    'gpio-hog',
+                                    'output-low',
+                                ]),
+                            DeviceTreeNode('ca9539_74_outhigh')
+                                .properties(['status = "disabled"']),
+                            DeviceTreeNode('tca9539_74_input')
+                                .properties(['status = "disabled"']),
+                        ])
+                ])
+        ])
 
 
 if __name__ == '__main__':
